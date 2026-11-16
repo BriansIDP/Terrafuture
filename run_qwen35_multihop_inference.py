@@ -8,6 +8,7 @@ import time
 import types
 from pathlib import Path
 import sys, os
+import random
 
 import torch
 import torch.nn as nn
@@ -97,7 +98,7 @@ def generate_text(model, processor, messages, max_new_tokens, do_sample=False):
     return text
 
 
-def decide_next_hop(model, processor, question, evidence, max_new_tokens):
+def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sample=False, firstprompt=False):
     """Decide whether current text evidence is enough, or what to search next."""
     # Parent groups may contain three pages. Avoid feeding all of them repeatedly.
     excerpts = []
@@ -110,22 +111,33 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens):
         excerpts.append(
             f"Document {parent['doc_id']}, pages {parent['page_numbers']}:\n{excerpt}"
         )
-    planner_prompt = (
-        "You are checking whether retrieved structural-standard excerpts contain ALL "
-        "information needed to answer a question accurately. Account for applicable "
-        "conditions, exceptions, referenced clauses, annexes and tables. "
-        "Do not answer the engineering question. "
-        "Return ONLY one JSON object: "
-        '{"decision":"ANSWER"} or '
-        '{"decision":"RETRIEVE","query":"specific missing clause, table or topic"}. '
-        "Choose RETRIEVE if an important referenced requirement is missing. "
-        "Choose ANSWER if the available excerpts are sufficient or if another "
-        "retrieval is not needed.\n\n"
-        f"Question: {question}\n\nEvidence:\n" + "\n\n".join(excerpts)
-    )
+    if firstprompt:
+        planner_prompt = (
+            "You are generating the query to search for information to answer an Engineering question to get "
+            "information needed to answer a question accurately from documents. Account for applicable "
+            "conditions, exceptions, referenced clauses, annexes and tables. "
+            "Do not answer the question. "
+            "Return ONLY one JSON object: "
+            '{"query":"specific missing information, table or topic"}. '
+            f"Question: {question}"
+        )
+    else:
+        planner_prompt = (
+            "You are checking whether retrieved documents contain ALL "
+            "information needed to answer a question accurately. Account for applicable "
+            "conditions, exceptions, referenced clauses, annexes and tables. "
+            "Do not answer the engineering question. "
+            "Return ONLY one JSON object: "
+            '{"decision":"ANSWER"} or '
+            '{"decision":"RETRIEVE","query":"specific missing clause, table or topic"}. '
+            "Choose RETRIEVE if an important referenced requirement is missing. "
+            "Choose ANSWER if the available excerpts are sufficient or if another "
+            "retrieval is not needed.\n\n"
+            f"Question: {question}\n\nEvidence:\n" + "\n\n".join(excerpts)
+        )
     raw = generate_text(model, processor, [
         {"role": "user", "content": planner_prompt},
-    ], max_new_tokens, do_sample=False)
+    ], max_new_tokens, do_sample=do_sample)
     try:
         # Tolerate a model wrapping JSON in a Markdown fence or brief prose.
         match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
@@ -134,6 +146,9 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens):
             query = str(decision.get("query", "")).strip()
             if query:
                 return "RETRIEVE", query
+        elif firstprompt:
+            query = str(decision.get("query", "")).strip()
+            return "RETRIEVE", query
     except (ValueError, TypeError, AttributeError):
         pass
     return "ANSWER", ""
@@ -231,6 +246,7 @@ def main():
     ap.add_argument('--rerank-top', type=int, default=50)
     ap.add_argument('--reranker-model', default='Qwen/Qwen3-Reranker-0.6B')
     ap.add_argument("--database-root", type=Path, default=Path("data/Phase1Standards"))
+    ap.add_argument('--seed', type=int, default=50)
 
     args = ap.parse_args()
     if args.max_hops < 1 or args.max_evidence_pages < 1:
@@ -240,6 +256,9 @@ def main():
         raise RuntimeError(
             'CUDA GPU not detected; run on a GPU compute node.'
         )
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # Each question is independent; manifests are resolved by the dataloader.
     records = read_records(args.questions)
@@ -292,10 +311,17 @@ def main():
         retrieval_trace = []
         if not args.disable_pdf:
             rec = dict(rec)
-            query = question
             collected = {}  # (doc_id, parent_id) -> retrieval hit
             seen_queries = set()
             pages_used = 0
+
+            # decision, next_query = decide_next_hop(
+            #     model, processor, question,
+            #     [], args.decision_tokens, do_sample=args.do_sample, firstprompt=True
+            # )
+            # query = next_query if next_query != "" else question
+            query = question
+            # print("NEXT QUERY:", next_query)
 
             for hop in range(args.max_hops):
                 if query.casefold() in seen_queries:
@@ -321,11 +347,11 @@ def main():
                     pages_used += page_count
                     new_hits += 1
 
-                print("Hop:", hop)
-                print("Pages used:", pages_used)
-                trace = {"hop": hop + 1, "query": query, "new_parents": new_hits,
-                         "total_pages": pages_used}
-                retrieval_trace.append(trace)
+                retrieved_pages = [
+                    {"doc_id": hit["parent"]["doc_id"],
+                    "pages": hit["parent"]["page_numbers"]}
+                    for hit in collected.values()
+                ]
                 if not collected or not new_hits or pages_used >= args.max_evidence_pages:
                     break
                 if hop == args.max_hops - 1:
@@ -333,8 +359,11 @@ def main():
 
                 decision, next_query = decide_next_hop(
                     model, processor, question,
-                    list(collected.values()), args.decision_tokens,
+                    list(collected.values()), args.decision_tokens, do_sample=args.do_sample
                 )
+                trace = {"hop": hop + 1, "query": next_query, "new_parents": new_hits,
+                         "total_pages": pages_used, "retrieved_pages": retrieved_pages}
+                retrieval_trace.append(trace)
                 trace["decision"] = decision
                 if decision == "ANSWER":
                     print("Answer now!")
@@ -398,8 +427,8 @@ def main():
 
         result["pred"] = prediction
 
-        print(f"\n[{rec['qid']}] Question: {question}")
-        print(f"[{rec['qid']}] Answer: {prediction}")
+        # print(f"\n[{rec['qid']}] Question: {question}")
+        # print(f"[{rec['qid']}] Answer: {prediction}")
 
         # -------------------------------------------------
         # 6. Cleanup and save.

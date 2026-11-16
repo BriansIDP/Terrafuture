@@ -18,61 +18,71 @@ export HF_HOME=/projects/u6zu/Terrafuture/ckpt
 #   --out-dir data/vss_rendered \
 #   --extract-content
 
-ckpt=/projects/u6zu/Terrafuture/Terra1/results/qwen35_9b_lora512_phase1/final
-# ckpt=no
-output=results/outputs/qwen35_pdfqa_lora512.json
+# ckpt=/projects/u6zu/Terrafuture/Terra1/results/qwen35_9b_lora512_phase1/final
+# # ckpt=no
+# output=results/outputs/qwen35_pdfqa_lora512.json
 
-python run_qwen35_pdfqa.py \
-    --questions data/preprocess/phase1_questions_modified.json \
-    --output $output \
-    --page-mode all \
-    --content-mode hybrid \
-    --inline-images \
-    --num-workers 0 \
-    --prefetch-factor 1 \
-    --gh200-patch-optimization \
-    --max-new-tokens 2048 \
-    --ckpt $ckpt \
-    # --disable_pdf \
+# python run_qwen35_pdfqa.py \
+#     --questions data/preprocess/phase1_questions_modified.json \
+#     --output $output \
+#     --page-mode all \
+#     --content-mode hybrid \
+#     --inline-images \
+#     --num-workers 0 \
+#     --prefetch-factor 1 \
+#     --gh200-patch-optimization \
+#     --max-new-tokens 2048 \
+#     --ckpt $ckpt \
+#     # --disable_pdf \
 
-python LLM_as_a_judge.py --resultpath results/outputs/qwen35_pdfqa_lora512.json
+# python LLM_as_a_judge.py --resultpath results/outputs/qwen35_pdfqa_lora512.json
 
 
-ckpt=/projects/u6zu/Terrafuture/Terra1/results/qwen35_9b_lora128_phase1/final
-# ckpt=no
-output=results/outputs/qwen35_pdfqa_lora128.json
+# ckpt=/projects/u6zu/Terrafuture/Terra1/results/qwen35_9b_lora128_phase1/final
+# # ckpt=no
+# output=results/outputs/qwen35_pdfqa_lora128.json
 
-python run_qwen35_pdfqa.py \
-    --questions data/preprocess/phase1_questions_modified.json \
-    --output $output \
-    --page-mode all \
-    --content-mode hybrid \
-    --inline-images \
-    --num-workers 0 \
-    --prefetch-factor 1 \
-    --gh200-patch-optimization \
-    --max-new-tokens 2048 \
-    --ckpt $ckpt \
-    # --disable_pdf \
+# python run_qwen35_pdfqa.py \
+#     --questions data/preprocess/phase1_questions_modified.json \
+#     --output $output \
+#     --page-mode all \
+#     --content-mode hybrid \
+#     --inline-images \
+#     --num-workers 0 \
+#     --prefetch-factor 1 \
+#     --gh200-patch-optimization \
+#     --max-new-tokens 2048 \
+#     --ckpt $ckpt \
+#     # --disable_pdf \
 
-python LLM_as_a_judge.py --resultpath results/outputs/qwen35_pdfqa_lora128.json
+# python LLM_as_a_judge.py --resultpath results/outputs/qwen35_pdfqa_lora128.json
 
-ckpt=/projects/u6zu/Terrafuture/Terra1/results/qwen35_lora_phase1/final
-# ckpt=no
-output=results/outputs/qwen35_pdfqa.json
+# ckpt=/projects/u6zu/Terrafuture/Terra1/results/qwen35_lora_phase1/final
+# # ckpt=no
+# output=results/outputs/qwen35_pdfqa.json
 
-python run_qwen35_pdfqa.py \
-    --questions data/preprocess/phase1_questions_modified.json \
-    --output $output \
-    --page-mode all \
-    --content-mode hybrid \
-    --inline-images \
-    --num-workers 0 \
-    --prefetch-factor 1 \
-    --gh200-patch-optimization \
-    --max-new-tokens 2048 \
-    --do-sample \
-    --ckpt $ckpt \
-    # --disable_pdf \
+# python run_qwen35_pdfqa.py \
+#     --questions data/preprocess/phase1_questions_modified.json \
+#     --output $output \
+#     --page-mode all \
+#     --content-mode hybrid \
+#     --inline-images \
+#     --num-workers 0 \
+#     --prefetch-factor 1 \
+#     --gh200-patch-optimization \
+#     --max-new-tokens 2048 \
+#     --do-sample \
+#     --ckpt $ckpt \
+#     # --disable_pdf \
 
-python LLM_as_a_judge.py --resultpath results/outputs/qwen35_pdfqa.json
+# python LLM_as_a_judge.py --resultpath results/outputs/qwen35_pdfqa.json
+
+
+python retriever.py build \
+    --database data/Phase1Standards \
+    --index-dir data/phase1_standards_db_16pages \
+    --embedding-model Qwen/Qwen3-Embedding-4B \
+    --max-words 350 \
+    --overlap 80 \
+    --parent-pages 16 \
+    --batch-size 4
