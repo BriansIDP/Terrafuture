@@ -3,13 +3,14 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
-#SBATCH --time=6:00:00
+#SBATCH --time=8:00:00
 #SBATCH --output=app_terra1_chainlit-%j.log
 
 set -euo pipefail
 source "$HOME/miniforge3/bin/activate"
 conda activate qwen35
-cd "$(dirname "$0")"
+# Slurm runs a copy of this script from its spool directory, not the project.
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$(realpath "$0")")}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen3.5-9B}"
 export LORA_PATH="${LORA_PATH:-/projects/u6zu/Terrafuture/Terra1/results/qwen35_9b_lora128_phase1/final/}"
