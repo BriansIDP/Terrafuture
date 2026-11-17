@@ -14,18 +14,18 @@ export HF_HOME=/projects/u6zu/Terrafuture/ckpt
 
 python train_qwen35_dpo_stage3.py \
     --model Qwen/Qwen3.5-9B \
-    --rollouts rollouts/qwen35_dual_max2_papers6_standards6.json \
-    --questions data/phase1_stage3_case_a_questions.json \
+    --rollouts rollouts/qwen35_dual_type_a_max3_papers6_standards6.json \
+    --questions /projects/u6zu/Terrafuture/Terra1/data/phase1_stage3_type_a_questions.json \
     --paper-database-root data/Phase1PDFBase \
     --standards-database-root data/Phase1Standards \
-    --output-dir results/qwen35_trajectory_dpo_stage3_max2_papers6_standards6 \
+    --output-dir exp/qwen35_trajectory_dpo_stage3_max3_papers6_standards6 \
     --page-mode selected \
     --content-mode hybrid \
     --inline-images \
     --min-score-gap 0.5 \
     --max-pairs-per-qid 10 \
     --beta 0.1 \
-    --epochs 3 \
+    --epochs 2 \
     --learning-rate 1e-5 \
     --warmup 10 \
     --lora-r 128 \
