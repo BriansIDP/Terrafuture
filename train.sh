@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=qwen35_train_phase1
+#SBATCH --job-name=qwen35_grpo_stage3
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 #SBATCH --time=24:00:00
-#SBATCH --output=qwen35_train_phase1-%j.log
+#SBATCH --output=qwen35_grpo_stage3-%j.log
 
 set -euo pipefail
 
@@ -28,23 +28,21 @@ export HF_HOME=/projects/u6zu/Terrafuture/ckpt
 #     --lora-r 128 \
 #     --lora-alpha 256 \
 
-traindata=data/preprocess/phase1_questions_modified.json
+traindata=/projects/u6zu/Terrafuture/Terra1/data/phase1_stage3_type_a_questions.json
 
-# Provide a scored JSON list with multiple standards-first rollouts per question.
-: "${ROLLOUTS:?Set ROLLOUTS to a scored standards-first dual-source rollout JSON file}"
+# Provide multiple scored rollouts per question, including behavior_logprob.
+: "${ROLLOUTS:?Set ROLLOUTS to a scored rollout JSON file with behavior_logprob}"
 
-python train_qwen35_dpo_stage3.py \
+python train_qwen35_grpo_stage3.py \
     --model "$model" \
     --rollouts "$ROLLOUTS" \
     --questions "$traindata" \
     --paper-database-root data/Phase1PDFBase \
     --standards-database-root data/Phase1Standards \
-    --output-dir results/qwen35_trajectory_dpo_stage3 \
-    --min-score-gap 0.5 \
-    --max-pairs-per-qid 10 \
+    --output-dir results/qwen35_trajectory_grpo_stage3 \
     --beta 0.1 \
     --epochs 3 \
     --learning-rate 1e-5 \
     --warmup 10 \
     --lora-r 128 \
-    --lora-alpha 256 \
+    --lora-alpha 256

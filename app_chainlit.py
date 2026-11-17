@@ -10,6 +10,13 @@ from chainlit.input_widget import Slider, Switch
 import app_with_retrieval as backend
 
 
+def ensure_model_ready():
+    """Load and warm the shared model once, even across concurrent sessions."""
+    with backend._gpu_lock:
+        if backend._model is None:
+            backend.initialize_model()
+
+
 @cl.on_chat_start
 async def start_chat():
     cl.user_session.set('documents', [])
@@ -17,13 +24,23 @@ async def start_chat():
     cl.user_session.set('retrieval_enabled', True)
     cl.user_session.set('max_tokens', 2048)
     cl.user_session.set('max_hops', backend.DEFAULT_MAX_HOPS)
+    status = cl.Message(content='Loading and warming up the model…')
+    await status.send()
+    try:
+        await asyncio.to_thread(ensure_model_ready)
+    except Exception as exc:
+        status.content = f'Model initialization failed: {type(exc).__name__}: {exc}'
+        await status.update()
+        return
+    status.content = 'Model ready.'
+    await status.update()
     await cl.ChatSettings([
         Switch(id='retrieval_enabled', label='PDF retrieval', initial=True),
         Slider(id='max_tokens', label='Maximum output tokens', initial=2048,
                min=64, max=8192, step=64),
         Slider(id='max_hops', label='Maximum search hops', initial=backend.DEFAULT_MAX_HOPS,
-               min=2, max=10, step=1,
-               description='Includes the initial paper and standards searches.'),
+               min=1, max=10, step=1,
+               description='Includes the initial standards search.'),
     ]).send()
     await cl.Message(content=(
         'Ask a question or attach PDFs to explore them alongside the indexed corpus. '
@@ -58,12 +75,9 @@ def run_turn(events, documents, files, question, model_history, retrieval_enable
             if len(documents) > before:
                 documents[-1]['name'] = name
         events.put(('documents', documents))
-        with backend._gpu_lock:
-            if backend._model is None:
-                events.put(('status', 'Loading and warming up the model…'))
-                backend.initialize_model()
         for history, details, updated_history in backend.ask(
-                [], documents, max_tokens, question, model_history, retrieval_enabled, max_hops):
+                [], documents, max_tokens, question, model_history, retrieval_enabled, max_hops,
+                progress=lambda status: events.put(('retrieval_progress', status))):
             events.put(('answer', (history[-1]['content'], details, updated_history)))
     except Exception as exc:
         events.put(('error', f'{type(exc).__name__}: {exc}'))
@@ -100,6 +114,7 @@ async def on_message(message: cl.Message):
     sent = False
     displayed = ''
     details = ''
+    progress_log = []
     updated_history = None
     async with cl.Step(name='PDF preparation and retrieval', type='retrieval') as step:
         while True:
@@ -108,6 +123,10 @@ async def on_message(message: cl.Message):
                 break
             if kind in ('status', 'upload_error'):
                 step.output = value
+                await step.update()
+            elif kind == 'retrieval_progress':
+                progress_log.append(value)
+                step.output = '\n\n'.join(progress_log)
                 await step.update()
             elif kind == 'documents':
                 cl.user_session.set('documents', value)
@@ -120,7 +139,7 @@ async def on_message(message: cl.Message):
             elif kind == 'answer':
                 content, details, updated_history = value
                 if content.startswith(('🔎 Retrieving', '🤖 Generating')):
-                    step.output = details
+                    step.output = '\n\n'.join(progress_log + [details])
                     await step.update()
                     continue
                 if not sent:
@@ -132,7 +151,7 @@ async def on_message(message: cl.Message):
                     response.content = content
                     await response.update()
                 displayed = content
-        step.output = details or step.output or 'Ready.'
+        step.output = '\n\n'.join(progress_log + ([details] if details else [])) or step.output or 'Ready.'
     if updated_history is not None:
         cl.user_session.set('model_history', updated_history)
     if sent:

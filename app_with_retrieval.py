@@ -23,7 +23,7 @@ from peft import PeftModel
 
 from retriever import PDFRetriever
 from run_qwen35_multihop_inference_dual import (
-    build_messages, decide_next_hop, generate_standards_query, retrieve_evidence, validate_index,
+    build_messages, decide_next_hop, retrieve_evidence, validate_index,
 )
 
 from pdfqa_dataloader import make_pdf_prompt, prompt_to_messages, read_manifest
@@ -42,7 +42,7 @@ STANDARDS_INDEX_DIR = Path(os.environ.get('STANDARDS_INDEX_DIR', str(ROOT / 'dat
 STANDARDS_DATABASE_ROOT = Path(os.environ.get('STANDARDS_DATABASE_ROOT', str(ROOT / 'data/Phase1Standards')))
 MAX_EVIDENCE_PAGES = int(os.environ.get('PDF_MAX_EVIDENCE_PAGES', '18'))
 DECISION_TOKENS = int(os.environ.get('PDF_DECISION_TOKENS', '160'))
-DEFAULT_MAX_HOPS = int(os.environ.get('PDF_MAX_HOPS', '4'))
+DEFAULT_MAX_HOPS = int(os.environ.get('PDF_MAX_HOPS', '10'))
 RETRIEVER_MODEL = os.environ.get('PDF_RERANKER_MODEL', 'Qwen/Qwen3-Reranker-0.6B')
 RETRIEVAL_TOP_N = int(os.environ.get('PDF_TOP_N', '5'))
 RETRIEVAL_CANDIDATES = int(os.environ.get('PDF_CANDIDATES', '100'))
@@ -415,7 +415,7 @@ def make_current_evidence(question, selected):
 
 
 def ask(history, documents, max_new_tokens, question, model_history, retrieval_enabled,
-        max_hops=DEFAULT_MAX_HOPS):
+        max_hops=DEFAULT_MAX_HOPS, progress=None):
     """Stream a turn using current retrieval + ALL previous plain Q/A turns."""
     history = list(history or [])
     documents = list(documents or [])
@@ -441,18 +441,20 @@ def ask(history, documents, max_new_tokens, question, model_history, retrieval_e
             model, processor = get_model()
             selected = []
             if retrieval_enabled:
-                if int(max_hops) < 2 or MAX_EVIDENCE_PAGES < 2:
-                    raise ValueError('Multi-hop retrieval requires at least 2 hops and 2 evidence pages.')
+                if int(max_hops) < 1 or MAX_EVIDENCE_PAGES < 1:
+                    raise ValueError('Retrieval requires at least 1 hop and 1 evidence page.')
                 previous_questions = [m['content'] for m in model_history if m['role'] == 'user']
                 retrieval_query = '\n'.join(previous_questions[-2:] + [question])
+                if progress:
+                    progress('Preparing paper and standards indexes.')
                 retrievers = get_dual_retrievers()
                 evidence, trace, stop_reason = retrieve_evidence(
                     retrieval_query, retrievers,
-                    lambda q, e: decide_next_hop(model, processor, q, e, DECISION_TOKENS),
-                    lambda q, e: generate_standards_query(model, processor, q, e, DECISION_TOKENS),
+                    lambda q, e, papers_only: decide_next_hop(
+                        model, processor, q, e, DECISION_TOKENS, papers_only=papers_only),
                     int(max_hops), MAX_EVIDENCE_PAGES,
                     {'papers': RETRIEVAL_TOP_N, 'standards': RETRIEVAL_TOP_N},
-                    RETRIEVAL_CANDIDATES, RETRIEVAL_RERANK_TOP,
+                    RETRIEVAL_CANDIDATES, RETRIEVAL_RERANK_TOP, progress=progress,
                 )
                 roots = {'papers': DATABASE_ROOT, 'standards': STANDARDS_DATABASE_ROOT}
                 current_messages = build_messages(question, evidence, roots, 'hybrid', True)
@@ -569,7 +571,7 @@ def build_gradio_app():
         staged = gr.Markdown('No PDF attachments waiting to send.')
         tokens = gr.Slider(64, 8192, value=2048, step=64,
                            label='Maximum output tokens')
-        hops = gr.Slider(2, 10, value=DEFAULT_MAX_HOPS, step=1,
+        hops = gr.Slider(1, 10, value=DEFAULT_MAX_HOPS, step=1,
                          label='Maximum search hops (papers and standards included)')
         details = gr.Markdown('')
 

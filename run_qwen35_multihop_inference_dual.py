@@ -88,12 +88,14 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sam
 
 
 def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
-                      top_n_by_source, candidates, rerank_top):
+                      top_n_by_source, candidates, rerank_top, progress=None):
     """Search standards first, then follow the planner within the budget."""
     collected, seen_pages, trace = [], set(), []
     source, query = 'standards', question
     stop_reason = 'max_hops'
     for hop in range(1, max_hops + 1):
+        if progress:
+            progress(f'Search {hop}/{max_hops}: searching {source} for: {query}')
         hits = retrievers[source].search(query=query, candidates=candidates,
                                          rerank_top=rerank_top, top_n=top_n_by_source[source])['results']
         added = []
@@ -120,19 +122,29 @@ def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
             collected.append(selected)
             added.append({'source': source, 'doc_id': parent['doc_id'], 'pages': pages})
         entry = {'hop': hop, 'source': source, 'query': query,
-                 'raw_results': hits,
+                 'raw_results': [{'doc_id': hit['parent']['doc_id'],
+                                  'pages': hit['parent']['page_numbers']}
+                                 for hit in hits],
                  'new_pages': added, 'total_pages': len(seen_pages)}
         trace.append(entry)
+        if progress:
+            progress(f'Search {hop}: found {len(hits)} results, added '
+                     f'{sum(len(item["pages"]) for item in added)} pages.')
         if hop == max_hops:
             stop_reason = 'max_hops'
             break
         if len(seen_pages) >= max_pages:
             stop_reason = 'max_evidence_pages'
             break
+        if progress:
+            progress('Checking whether the evidence is sufficient' +
+                     (' or papers are needed.' if hop == 1 else ' and which source to search next.'))
         decision = decide(question, collected, hop == 1)
         entry['planner'] = decision
         entry['decision'] = decision['decision']
         if decision['decision'] == 'ANSWER':
+            if progress:
+                progress('Planner chose to answer.')
             stop_reason = 'answer'
             break
         if decision['decision'] != 'RETRIEVE':
@@ -141,8 +153,14 @@ def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
             source = 'papers' if hop == 1 or source == 'standards' else 'standards'
             query = question
             entry['fallback'] = {'source': source, 'query': query}
+            if progress:
+                progress(f'Planner response was invalid; falling back to {source}.')
         else:
             source, query = decision['source'], decision['query']
+            if progress:
+                progress(f'Planner chose to search {source}.')
+    if progress:
+        progress(f'Retrieval stopped: {stop_reason}.')
     return collected, trace, stop_reason
 
 
