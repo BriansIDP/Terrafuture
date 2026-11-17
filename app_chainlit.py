@@ -10,6 +10,17 @@ from chainlit.input_widget import Slider, Switch
 import app_with_retrieval as backend
 
 
+def ensure_model_ready():
+    """Load and warm the shared model once, including concurrent chat starts."""
+    with backend._gpu_lock:
+        if backend._model is None or backend._processor is None:
+            backend.initialize_model()
+
+
+# Chainlit imports this module during server startup, before any chat session.
+ensure_model_ready()
+
+
 @cl.on_chat_start
 async def start_chat():
     cl.user_session.set('documents', [])
@@ -22,7 +33,7 @@ async def start_chat():
         Slider(id='max_tokens', label='Maximum output tokens', initial=2048,
                min=64, max=8192, step=64),
         Slider(id='max_hops', label='Maximum search hops', initial=backend.DEFAULT_MAX_HOPS,
-               min=2, max=10, step=1,
+               min=2, max=12, step=1,
                description='Includes the initial paper and standards searches.'),
     ]).send()
     await cl.Message(content=(
@@ -58,12 +69,10 @@ def run_turn(events, documents, files, question, model_history, retrieval_enable
             if len(documents) > before:
                 documents[-1]['name'] = name
         events.put(('documents', documents))
-        with backend._gpu_lock:
-            if backend._model is None:
-                events.put(('status', 'Loading and warming up the model…'))
-                backend.initialize_model()
+        ensure_model_ready()
         for history, details, updated_history in backend.ask(
-                [], documents, max_tokens, question, model_history, retrieval_enabled, max_hops):
+                [], documents, max_tokens, question, model_history, retrieval_enabled, max_hops,
+                progress=lambda status: events.put(('status', status))):
             events.put(('answer', (history[-1]['content'], details, updated_history)))
     except Exception as exc:
         events.put(('error', f'{type(exc).__name__}: {exc}'))
@@ -101,13 +110,15 @@ async def on_message(message: cl.Message):
     displayed = ''
     details = ''
     updated_history = None
+    progress_lines = []
     async with cl.Step(name='PDF preparation and retrieval', type='retrieval') as step:
         while True:
             kind, value = await asyncio.to_thread(events.get)
             if kind == 'done':
                 break
             if kind in ('status', 'upload_error'):
-                step.output = value
+                progress_lines.append(value)
+                step.output = '\n\n'.join(progress_lines)
                 await step.update()
             elif kind == 'documents':
                 cl.user_session.set('documents', value)
@@ -120,7 +131,11 @@ async def on_message(message: cl.Message):
             elif kind == 'answer':
                 content, details, updated_history = value
                 if content.startswith(('🔎 Retrieving', '🤖 Generating')):
-                    step.output = details
+                    if details and details not in progress_lines:
+                        progress_lines.append(details)
+                    if content not in progress_lines:
+                        progress_lines.append(content)
+                    step.output = '\n\n'.join(progress_lines)
                     await step.update()
                     continue
                 if not sent:
@@ -132,7 +147,9 @@ async def on_message(message: cl.Message):
                     response.content = content
                     await response.update()
                 displayed = content
-        step.output = details or step.output or 'Ready.'
+        if details and details not in progress_lines:
+            progress_lines.append(details)
+        step.output = '\n\n'.join(progress_lines) or 'Ready.'
     if updated_history is not None:
         cl.user_session.set('model_history', updated_history)
     if sent:

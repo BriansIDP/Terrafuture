@@ -106,12 +106,14 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sam
 
 
 def retrieve_evidence(question, retrievers, decide, standards_query, max_hops, max_pages,
-                      top_n_by_source, candidates, rerank_top):
+                      top_n_by_source, candidates, rerank_top, progress=None):
     """Run the two mandatory searches, then follow the planner within the budget."""
     collected, seen_pages, trace = [], set(), []
     source, query = 'papers', question
     stop_reason = 'max_hops'
     for hop in range(1, max_hops + 1):
+        if progress:
+            progress(f'Search {hop}/{max_hops}: searching {source} for: {query}')
         hits = retrievers[source].search(query=query, candidates=candidates,
                                          rerank_top=rerank_top, top_n=top_n_by_source[source])['results']
         added = []
@@ -142,7 +144,12 @@ def retrieve_evidence(question, retrievers, decide, standards_query, max_hops, m
         entry = {'hop': hop, 'source': source, 'query': query,
                  'new_pages': added, 'total_pages': len(seen_pages)}
         trace.append(entry)
+        if progress:
+            count = sum(len(item['pages']) for item in added)
+            progress(f'Search {hop}/{max_hops}: found {count} new pages in {source} ({len(seen_pages)} total).')
         if hop == 1:
+            if progress:
+                progress('Preparing a standards search from the paper evidence…')
             generated = standards_query(question, collected)
             source, query = 'standards', generated['query']
             entry['decision'] = 'RETRIEVE'
@@ -156,6 +163,8 @@ def retrieve_evidence(question, retrievers, decide, standards_query, max_hops, m
         if len(seen_pages) >= max_pages:
             stop_reason = 'max_evidence_pages'
             break
+        if progress:
+            progress('Reviewing the evidence and deciding whether another search is needed…')
         decision = decide(question, collected)
         entry['planner'] = decision
         entry['decision'] = decision['decision']

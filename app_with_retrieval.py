@@ -415,7 +415,7 @@ def make_current_evidence(question, selected):
 
 
 def ask(history, documents, max_new_tokens, question, model_history, retrieval_enabled,
-        max_hops=DEFAULT_MAX_HOPS):
+        max_hops=DEFAULT_MAX_HOPS, progress=None):
     """Stream a turn using current retrieval + ALL previous plain Q/A turns."""
     history = list(history or [])
     documents = list(documents or [])
@@ -445,6 +445,8 @@ def ask(history, documents, max_new_tokens, question, model_history, retrieval_e
                     raise ValueError('Multi-hop retrieval requires at least 2 hops and 2 evidence pages.')
                 previous_questions = [m['content'] for m in model_history if m['role'] == 'user']
                 retrieval_query = '\n'.join(previous_questions[-2:] + [question])
+                if progress:
+                    progress('Loading and validating the paper and standards indexes…')
                 retrievers = get_dual_retrievers()
                 evidence, trace, stop_reason = retrieve_evidence(
                     retrieval_query, retrievers,
@@ -452,8 +454,10 @@ def ask(history, documents, max_new_tokens, question, model_history, retrieval_e
                     lambda q, e: generate_standards_query(model, processor, q, e, DECISION_TOKENS),
                     int(max_hops), MAX_EVIDENCE_PAGES,
                     {'papers': RETRIEVAL_TOP_N, 'standards': RETRIEVAL_TOP_N},
-                    RETRIEVAL_CANDIDATES, RETRIEVAL_RERANK_TOP,
+                    RETRIEVAL_CANDIDATES, RETRIEVAL_RERANK_TOP, progress=progress,
                 )
+                if progress:
+                    progress(f'Retrieval complete ({stop_reason}). Preparing evidence for the model…')
                 roots = {'papers': DATABASE_ROOT, 'standards': STANDARDS_DATABASE_ROOT}
                 current_messages = build_messages(question, evidence, roots, 'hybrid', True)
                 uploaded = uploaded_pages(documents)
