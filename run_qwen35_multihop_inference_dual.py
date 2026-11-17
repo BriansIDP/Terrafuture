@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Qwen multi-hop inference over separate paper and standards indexes.
 
-Each question searches papers first and standards second. Both searches count
-against --max-hops. Subsequent searches are chosen by the model. Build each
-index with retriever.py build against its corresponding database root.
+Each question searches standards first. The model can then answer or search
+papers; subsequent searches can target either source. All searches count against
+--max-hops. Build each index with retriever.py build against its database root.
 """
 
 import argparse
@@ -50,41 +50,22 @@ def evidence_excerpts(evidence):
     return '\n\n'.join(excerpts)
 
 
-def generate_standards_query(model, processor, question, evidence, max_new_tokens, do_sample=False):
-    """Generate a standards search from the question and initial paper evidence."""
-    prompt = (
-        'Generate a search query for structural design standards needed to answer '
-        'the engineering question. Use the paper evidence to identify relevant '
-        'design provisions, terminology and referenced standards. Target the '
-        'applicable requirements, clauses, tables, conditions or exceptions, '
-        'rather than research findings. Do not answer the question or invent '
-        'standard numbers or clauses. Return ONLY one JSON object: '
-        '{"query":"specific standards requirements or topic"}.\n\nQuestion: '
-        + question + '\n\nPaper evidence:\n' + evidence_excerpts(evidence)
+def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sample=False,
+                    papers_only=False):
+    """Choose ANSWER or a retrieval source and query."""
+    retrieval_option = (
+        '{"decision":"RETRIEVE","source":"papers","query":"specific missing information"}. '
+        'The only permitted retrieval source is papers.'
+        if papers_only else
+        '{"decision":"RETRIEVE","source":"papers" or "standards",'
+        '"query":"specific missing information"}. Choose a single source for each retrieval.'
     )
-    raw = generate_text(model, processor, [{'role': 'user', 'content': prompt}],
-                        max_new_tokens, do_sample=do_sample)
-    try:
-        match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
-        obj = json.loads(match.group(0) if match else raw)
-        query = obj.get('query')
-        if isinstance(query, str) and query.strip():
-            return {'query': query.strip(), 'raw': raw}
-    except (ValueError, TypeError, AttributeError):
-        pass
-    return {'query': question, 'raw': raw, 'fallback': True}
-
-
-def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sample=False):
-    """Choose ANSWER or a specific database and query using both sources."""
     prompt = (
         'Decide whether the evidence is sufficient to answer the engineering '
         'question. Consider missing research findings, applicable standard '
         'requirements, conditions, exceptions, annexes and tables. Do not answer '
         'the question. Return ONLY one JSON object: {"decision":"ANSWER"} or '
-        '{"decision":"RETRIEVE","source":"papers" or "standards",'
-        '"query":"specific missing information"}. Choose a single source for '
-        'each retrieval.\n\nQuestion: ' + question + '\n\nEvidence:\n' +
+        + retrieval_option + '\n\nQuestion: ' + question + '\n\nEvidence:\n' +
         evidence_excerpts(evidence)
     )
     raw = generate_text(model, processor, [{'role': 'user', 'content': prompt}],
@@ -97,7 +78,8 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sam
             return {'decision': 'ANSWER', 'raw': raw}
         source = str(obj.get('source', '')).lower().strip()
         query = str(obj.get('query', '')).strip()
-        if action == 'RETRIEVE' and source in ('papers', 'standards') and query:
+        allowed_sources = ('papers',) if papers_only else ('papers', 'standards')
+        if action == 'RETRIEVE' and source in allowed_sources and query:
             return {'decision': 'RETRIEVE', 'source': source, 'query': query, 'raw': raw}
     except (ValueError, TypeError, AttributeError):
         pass
@@ -105,18 +87,16 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sam
     return {'decision': 'INVALID', 'raw': raw}
 
 
-def retrieve_evidence(question, retrievers, decide, standards_query, max_hops, max_pages,
+def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
                       top_n_by_source, candidates, rerank_top):
-    """Run the two mandatory searches, then follow the planner within the budget."""
+    """Search standards first, then follow the planner within the budget."""
     collected, seen_pages, trace = [], set(), []
-    source, query = 'papers', question
+    source, query = 'standards', question
     stop_reason = 'max_hops'
     for hop in range(1, max_hops + 1):
         hits = retrievers[source].search(query=query, candidates=candidates,
                                          rerank_top=rerank_top, top_n=top_n_by_source[source])['results']
         added = []
-        # Reserve at least one page for standards during the initial paper search.
-        limit = max_pages - 1 if hop == 1 else max_pages
         for hit in hits:
             parent = hit['parent']
             pages = []
@@ -127,7 +107,7 @@ def retrieve_evidence(question, retrievers, decide, standards_query, max_hops, m
                 + parent['page_numbers']))
             for number in page_order:
                 key = (source, parent['doc_id'], int(number))
-                if key not in seen_pages and len(seen_pages) < limit:
+                if key not in seen_pages and len(seen_pages) < max_pages:
                     seen_pages.add(key)
                     pages.append(int(number))
             if not pages:
@@ -140,23 +120,16 @@ def retrieve_evidence(question, retrievers, decide, standards_query, max_hops, m
             collected.append(selected)
             added.append({'source': source, 'doc_id': parent['doc_id'], 'pages': pages})
         entry = {'hop': hop, 'source': source, 'query': query,
+                 'raw_results': hits,
                  'new_pages': added, 'total_pages': len(seen_pages)}
         trace.append(entry)
-        if hop == 1:
-            generated = standards_query(question, collected)
-            source, query = 'standards', generated['query']
-            entry['decision'] = 'RETRIEVE'
-            entry['next_source'] = source
-            entry['next_query'] = query
-            entry['standards_query_generation'] = generated
-            continue
         if hop == max_hops:
             stop_reason = 'max_hops'
             break
         if len(seen_pages) >= max_pages:
             stop_reason = 'max_evidence_pages'
             break
-        decision = decide(question, collected)
+        decision = decide(question, collected, hop == 1)
         entry['planner'] = decision
         entry['decision'] = decision['decision']
         if decision['decision'] == 'ANSWER':
@@ -165,7 +138,7 @@ def retrieve_evidence(question, retrievers, decide, standards_query, max_hops, m
         if decision['decision'] != 'RETRIEVE':
             # Malformed planner output is not an ANSWER. Continue with a
             # deterministic fallback until the search budget is exhausted.
-            source = 'papers' if source == 'standards' else 'standards'
+            source = 'papers' if hop == 1 or source == 'standards' else 'standards'
             query = question
             entry['fallback'] = {'source': source, 'query': query}
         else:
@@ -235,7 +208,7 @@ def main():
     ap.add_argument('--standards-top-n', type=int, help='Ranked standards parent passages per search (overrides --top-n)')
     ap.add_argument('--candidates', type=int, default=100)
     ap.add_argument('--rerank-top', type=int, default=50)
-    ap.add_argument('--max-hops', type=int, default=4, help='Total searches, including the mandatory first two')
+    ap.add_argument('--max-hops', type=int, default=4, help='Maximum total searches, including the initial standards search')
     ap.add_argument('--max-evidence-pages', type=int, default=18)
     ap.add_argument('--decision-tokens', type=int, default=160)
     ap.add_argument('--max-new-tokens', type=int, default=768)
@@ -247,8 +220,8 @@ def main():
     ap.add_argument('--do-sample', action='store_true')
     ap.add_argument('--seed', type=int, default=50)
     args = ap.parse_args()
-    if args.max_hops < 2 or args.max_evidence_pages < 2:
-        ap.error('--max-hops and --max-evidence-pages must be >= 2 for both initial searches')
+    if args.max_hops < 1 or args.max_evidence_pages < 1:
+        ap.error('--max-hops and --max-evidence-pages must be positive')
     top_n_by_source = {
         'papers': args.paper_top_n if args.paper_top_n is not None else args.top_n,
         'standards': args.standards_top_n if args.standards_top_n is not None else args.top_n,
@@ -283,11 +256,10 @@ def main():
     results = []
     for record in tqdm(records, desc='Dual-source multi-hop RAG'):
         question = record['question']
-        planner = lambda q, e: decide_next_hop(model, processor, q, e, args.decision_tokens, args.do_sample)
-        standards_planner = lambda q, e: generate_standards_query(
-            model, processor, q, e, args.decision_tokens, args.do_sample)
+        planner = lambda q, e, papers_only: decide_next_hop(
+            model, processor, q, e, args.decision_tokens, args.do_sample, papers_only)
         evidence, trace, stop_reason = retrieve_evidence(
-            question, retrievers, planner, standards_planner, args.max_hops, args.max_evidence_pages,
+            question, retrievers, planner, args.max_hops, args.max_evidence_pages,
             top_n_by_source, args.candidates, args.rerank_top)
         messages = build_messages(question, evidence, roots, args.content_mode, args.inline_images)
         prediction = generate_text(model, processor, messages, args.max_new_tokens, args.do_sample)
