@@ -63,12 +63,12 @@ testdata=data/preprocess/phase1_standard_test.json
 #     --ckpt $ckpt \
 #     # --disable_pdf \
 
-# ckpt=/projects/u6zu/Terrafuture/Terra1/exp/qwen35_trajectory_dpo_max3_top3/final
-ckpt=no
+ckpt=/projects/u6zu/Terrafuture/Terra1/exp/qwen35_trajectory_dpo_max1_top6/final
+# ckpt=no
 testdata=data/preprocess/phase1_questions_modified.json
 # testdata=data/phase1_stage3_case_a_questions.json
 # output=rollouts/qwen35_pdfqa_with_retriever_max1_top8_seed${1}.json
-output=rollouts/qwen35_pdfqa_stage3_with_retriever_max3_top3.json
+output=rollouts/qwen35_pdfqa_with_retriever_DPO_max1_top6.json
 python run_qwen35_multihop_inference.py \
     --questions $testdata \
     --output $output \
@@ -77,8 +77,8 @@ python run_qwen35_multihop_inference.py \
     --content-mode hybrid \
     --num-workers 2 \
     --prefetch-factor 1 \
-    --max-hops 3 \
-    --top-n 3 \
+    --max-hops 1 \
+    --top-n 6 \
     --max-evidence-pages 128 \
     --gh200-patch-optimization \
     --max-new-tokens 2048 \
