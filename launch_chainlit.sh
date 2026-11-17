@@ -3,13 +3,28 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
-#SBATCH --time=6:00:00
+#SBATCH --time=8:00:00
 #SBATCH --output=app_terra1_chainlit-%j.log
 
 set -euo pipefail
 source "$HOME/miniforge3/bin/activate"
 conda activate qwen35
-cd "$(dirname "$0")"
+# Slurm executes a copy of this script from its spool directory.
+if [[ -n "${TERRA1_DIR:-}" ]]; then
+    project_dir="$TERRA1_DIR"
+elif [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    project_dir="${SLURM_SUBMIT_DIR:-/projects/u6zu/Terrafuture/Terra1}"
+    if [[ ! -f "$project_dir/app_chainlit.py" ]]; then
+        project_dir=/projects/u6zu/Terrafuture/Terra1
+    fi
+else
+    project_dir="$(dirname "$(realpath "$0")")"
+fi
+cd "$project_dir"
+if [[ ! -f app_chainlit.py ]]; then
+    echo "Cannot find app_chainlit.py in $PWD; set TERRA1_DIR to the project directory." >&2
+    exit 1
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen3.5-9B}"
 export LORA_PATH="${LORA_PATH:-/projects/u6zu/Terrafuture/Terra1/results/qwen35_9b_lora128_phase1/final/}"
