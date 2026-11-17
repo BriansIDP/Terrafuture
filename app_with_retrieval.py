@@ -22,6 +22,9 @@ from transformers import AutoModelForMultimodalLM, AutoProcessor, TextIteratorSt
 from peft import PeftModel
 
 from retriever import PDFRetriever
+from run_qwen35_multihop_inference_dual import (
+    build_messages, decide_next_hop, generate_standards_query, retrieve_evidence, validate_index,
+)
 
 from pdfqa_dataloader import make_pdf_prompt, prompt_to_messages, read_manifest
 
@@ -32,9 +35,14 @@ MAX_PDF_MB = int(os.environ.get('MAX_PDF_MB', '50'))
 MAX_PAGES = int(os.environ.get('MAX_PAGES', '200'))
 MAX_IMAGE_EDGE = int(os.environ.get('MAX_IMAGE_EDGE', '1400'))
 MAX_TEXT_PER_PAGE = int(os.environ.get('MAX_TEXT_PER_PAGE', '14000'))
-# Optional prebuilt retrieval index (same index as the evaluation script).
-INDEX_DIR = os.environ.get('PDF_INDEX_DIR', '')
-DATABASE_ROOT = Path(os.environ.get('PDF_DATABASE_ROOT', 'data/Phase1PDFBase'))
+# Prebuilt hybrid retrieval index and the manifests used to build it.
+INDEX_DIR = Path(os.environ.get('PDF_INDEX_DIR', str(ROOT / 'data/phase1_vector_db')))
+DATABASE_ROOT = Path(os.environ.get('PDF_DATABASE_ROOT', str(ROOT / 'data/Phase1PDFBase')))
+STANDARDS_INDEX_DIR = Path(os.environ.get('STANDARDS_INDEX_DIR', str(ROOT / 'data/phase1_standards_db')))
+STANDARDS_DATABASE_ROOT = Path(os.environ.get('STANDARDS_DATABASE_ROOT', str(ROOT / 'data/Phase1Standards')))
+MAX_EVIDENCE_PAGES = int(os.environ.get('PDF_MAX_EVIDENCE_PAGES', '18'))
+DECISION_TOKENS = int(os.environ.get('PDF_DECISION_TOKENS', '160'))
+DEFAULT_MAX_HOPS = int(os.environ.get('PDF_MAX_HOPS', '4'))
 RETRIEVER_MODEL = os.environ.get('PDF_RERANKER_MODEL', 'Qwen/Qwen3-Reranker-0.6B')
 RETRIEVAL_TOP_N = int(os.environ.get('PDF_TOP_N', '5'))
 RETRIEVAL_CANDIDATES = int(os.environ.get('PDF_CANDIDATES', '100'))
@@ -46,6 +54,7 @@ _model = None
 _processor = None
 _gpu_lock = threading.Lock()
 _retriever = None
+_dual_retrievers = None
 _corpus_manifests = None
 
 
@@ -113,7 +122,7 @@ def initialize_model():
         output_ids = model.generate(**inputs, max_new_tokens=8, do_sample=False)
     torch.cuda.synchronize()
     print(f'[startup] Warmup finished in {time.perf_counter() - started:.1f}s; '
-          'starting Gradio now.', flush=True)
+          'model ready.', flush=True)
     del inputs, output_ids, warmup_image
     _model, _processor = model, processor
 
@@ -262,35 +271,9 @@ def clear_conversation(documents, history, model_history):
     yield [], [], 'Chat cleared. No PDFs attached.', '', [], staged_label([]), '', '', []
 
 
-STOPWORDS = set('a an and are as at be by can do does for from how in is it of on or the this to was were what when where which who why with using into about paper pdf'.split())
-
-
-def retrieve_pages(manifest, query, count):
-    """Small zero-dependency lexical retrieval over extracted PDF text.
-
-    Supports multi-column PDFs imperfectly; the page images remain authoritative.
-    """
-    terms = [w for w in re.findall(r'[a-z0-9][a-z0-9_-]*', query.lower())
-             if len(w) > 2 and w not in STOPWORDS]
-    terms = list(dict.fromkeys(terms))
-    pages = manifest['pages']
-    if not terms:
-        return pages[:count]
-    scored = []
-    for page in pages:
-        content = ' '.join(b.get('text', '') for b in page.get('content', []) if b['type'] == 'text').lower()
-        # Prefer pages matching several unique keywords over those repeating one term.
-        score = sum(3 + min(content.count(t), 5) for t in terms if t in content)
-        scored.append((score, page['page'], page))
-    winners = sorted(scored, key=lambda item: (-item[0], item[1]))[:count]
-    return sorted([p for _, _, p in winners], key=lambda p: p['page'])
-
-
 def get_retriever():
     """Initialize an index-backed retriever lazily, under _gpu_lock."""
     global _retriever
-    if not INDEX_DIR:
-        return None
     if _retriever is None:
         _retriever = PDFRetriever(
             index_dir=Path(INDEX_DIR),
@@ -300,18 +283,34 @@ def get_retriever():
     return _retriever
 
 
+def get_dual_retrievers():
+    """Load and validate both indexes once, under the GPU lock."""
+    global _dual_retrievers
+    if _dual_retrievers is None:
+        indexes = {'papers': INDEX_DIR, 'standards': STANDARDS_INDEX_DIR}
+        roots = {'papers': DATABASE_ROOT, 'standards': STANDARDS_DATABASE_ROOT}
+        for source in roots:
+            validate_index(indexes[source], roots[source])
+        _dual_retrievers = {
+            source: PDFRetriever(index_dir=indexes[source], reranker_model=RETRIEVER_MODEL,
+                                 device='cuda')
+            for source in roots
+        }
+    return _dual_retrievers
+
+
 def get_corpus_manifests():
     """Find page manifests under the indexed PDF database root once."""
     global _corpus_manifests
     if _corpus_manifests is None:
         _corpus_manifests = {}
         if DATABASE_ROOT.exists():
-            for path in DATABASE_ROOT.rglob('manifest.json'):
-                # Accept doc ids that correspond to a folder name, PDF stem,
-                # or the folder containing the rendered output.
-                aliases = {path.parent.name, path.parent.parent.name}
-                for key in aliases:
-                    _corpus_manifests.setdefault(key, path)
+            for path in sorted(DATABASE_ROOT.rglob('manifest.json')):
+                doc_id = str(path.parent.relative_to(DATABASE_ROOT))
+                if doc_id == '.':
+                    data = json.loads(path.read_text(encoding='utf-8'))
+                    doc_id = Path(data.get('pdf', '')).stem or 'document'
+                _corpus_manifests[doc_id] = path
     return _corpus_manifests
 
 
@@ -319,11 +318,9 @@ def indexed_pages(question, documents):
     """Retrieve extra pages, excluding PDFs already uploaded in this session.
 
     Preserve retrieval-ranked document order, but present each document's pages
-    in ascending PDF page order. RETRIEVAL_TOP_N limits only indexed evidence.
+    in ascending PDF page order. RETRIEVAL_TOP_N limits parent contexts.
     """
     retriever = get_retriever()
-    if retriever is None:
-        return [], []
     hits = retriever.search(
         query=question,
         candidates=RETRIEVAL_CANDIDATES,
@@ -346,9 +343,10 @@ def indexed_pages(question, documents):
         parent = hit['parent']
         doc_id = str(parent['doc_id'])
         if (Path(doc_id).name.casefold() in uploaded_names or
-                Path(doc_id).stem.casefold() in uploaded_names):
+                Path(doc_id).stem.casefold() in uploaded_names or
+                Path(parent.get('pdf', '')).name.casefold() in uploaded_names):
             continue  # Entire uploaded PDF supersedes its indexed counterpart.
-        path = manifest_map.get(doc_id) or manifest_map.get(Path(doc_id).stem)
+        path = manifest_map.get(doc_id)
         if path is None:
             unresolved.append(doc_id)
             continue
@@ -363,10 +361,6 @@ def indexed_pages(question, documents):
                 continue
             seen.add(key)
             selected.append((doc_id, page_map[number]))
-            if len(selected) >= RETRIEVAL_TOP_N:
-                break
-        if len(selected) >= RETRIEVAL_TOP_N:
-            break
 
     # Group by document in first-seen retrieval order; within each document,
     # present pages in their original numerical order.
@@ -420,7 +414,8 @@ def make_current_evidence(question, selected):
     return prompt_to_messages(''.join(chunks), images), used
 
 
-def ask(history, documents, max_new_tokens, question, model_history, retrieval_enabled):
+def ask(history, documents, max_new_tokens, question, model_history, retrieval_enabled,
+        max_hops=DEFAULT_MAX_HOPS):
     """Stream a turn using current retrieval + ALL previous plain Q/A turns."""
     history = list(history or [])
     documents = list(documents or [])
@@ -446,26 +441,33 @@ def ask(history, documents, max_new_tokens, question, model_history, retrieval_e
             model, processor = get_model()
             selected = []
             if retrieval_enabled:
-                # Search on every turn; older evidence is never appended to messages.
-                # Historical user questions help disambiguate follow-up queries.
-                previous_questions = [m['content'] for m in model_history
-                                    if m['role'] == 'user']
+                if int(max_hops) < 2 or MAX_EVIDENCE_PAGES < 2:
+                    raise ValueError('Multi-hop retrieval requires at least 2 hops and 2 evidence pages.')
+                previous_questions = [m['content'] for m in model_history if m['role'] == 'user']
                 retrieval_query = '\n'.join(previous_questions[-2:] + [question])
-                # Uploaded PDFs take priority: include every page in its original
-                # order. Append only non-uploaded indexed evidence afterward.
+                retrievers = get_dual_retrievers()
+                evidence, trace, stop_reason = retrieve_evidence(
+                    retrieval_query, retrievers,
+                    lambda q, e: decide_next_hop(model, processor, q, e, DECISION_TOKENS),
+                    lambda q, e: generate_standards_query(model, processor, q, e, DECISION_TOKENS),
+                    int(max_hops), MAX_EVIDENCE_PAGES,
+                    {'papers': RETRIEVAL_TOP_N, 'standards': RETRIEVAL_TOP_N},
+                    RETRIEVAL_CANDIDATES, RETRIEVAL_RERANK_TOP,
+                )
+                roots = {'papers': DATABASE_ROOT, 'standards': STANDARDS_DATABASE_ROOT}
+                current_messages = build_messages(question, evidence, roots, 'hybrid', True)
                 uploaded = uploaded_pages(documents)
-                retrieved, unresolved = indexed_pages(retrieval_query, documents)
-                selected = uploaded + retrieved
-
-                if selected:
-                    current_messages, used = make_current_evidence(question, selected)
-                    details = 'Current-turn PDF evidence: ' + ', '.join(used)
-                else:
-                    current_messages = [{'role': 'user', 'content': question}]
-                    details = 'No PDF pages retrieved for this turn.'
-                if unresolved:
-                    details += (' | Unresolved indexed doc IDs: ' +
-                                ', '.join(dict.fromkeys(unresolved) )[:400])
+                if uploaded:
+                    upload_messages, _ = make_current_evidence(question, uploaded)
+                    current_messages[0]['content'] = (
+                        upload_messages[0]['content'] + current_messages[0]['content'])
+                selected = uploaded or evidence
+                hops = [f"{t['hop']}: {t['source']} ({sum(len(x['pages']) for x in t['new_pages'])} new pages)"
+                        for t in trace]
+                sources = [f"{hit['source']}/{hit['parent']['doc_id']} p.{','.join(map(str, hit['pages']))}"
+                           for hit in evidence]
+                details = ('Searches: ' + '; '.join(hops) + f' | Stop: {stop_reason}' +
+                           (' | Evidence: ' + ', '.join(sources) if sources else ' | No indexed pages found.'))
             else:
                 # No retrieval, no PDF images, no extracted PDF text.
                 current_messages = [
@@ -538,64 +540,69 @@ def ask(history, documents, max_new_tokens, question, model_history, retrieval_e
         yield history, 'Generation failed.', model_history
 
 
-with gr.Blocks(title='Qwen3.5 PDF Chat') as demo:
-    retrieval_enabled = gr.State(True)
-    gr.Markdown('# Qwen3.5 Chat with PDFs\n'
-                'Attach one or more PDFs, optionally enter a message, and click **Send**. '
-                'PDFs appear as **user messages**, and remain available for later turns. '
-                'PDF extraction always includes text and figure crops.')
-    documents = gr.State([])
-    pending_query = gr.State('')
-    pending_files = gr.State([])
-    model_history = gr.State([])  # Plain Q/A only; no retrieved PDF evidence.
-    with gr.Row():
-        clear = gr.Button('🧹 Clear chat and PDFs')
-    status = gr.Markdown('No PDFs attached. You can start chatting now.')
-    chat = gr.Chatbot(label='Conversation', type='messages', height=350,
-                      group_consecutive_messages=False)
-    with gr.Row():
-        question = gr.Textbox(label='Message',
-                              placeholder='Write a message and/or attach PDFs, then click Send…',
-                              scale=8, lines=2)
+def build_gradio_app():
+    with gr.Blocks(title='Qwen3.5 PDF Chat') as demo:
+        retrieval_enabled = gr.State(True)
+        gr.Markdown('# Qwen3.5 Chat with PDFs\n'
+                    'Attach one or more PDFs, optionally enter a message, and click **Send**. '
+                    'PDFs appear as **user messages**, and remain available for later turns. '
+                    'PDF extraction always includes text and figure crops.')
+        documents = gr.State([])
+        pending_query = gr.State('')
+        pending_files = gr.State([])
+        model_history = gr.State([])  # Plain Q/A only; no retrieved PDF evidence.
         with gr.Row():
-            attach = gr.UploadButton('📎 Attach PDF', file_types=['.pdf'],
-                                    file_count='single', type='filepath', variant='secondary')
-            submit = gr.Button('Send', variant='primary', scale=1)
+            clear = gr.Button('🧹 Clear chat and PDFs')
+        status = gr.Markdown('No PDFs attached. You can start chatting now.')
+        chat = gr.Chatbot(label='Conversation', type='messages', height=350,
+                          group_consecutive_messages=False)
         with gr.Row():
-            retrieval_button = gr.Button('📚 PDF Retrieval: ON', variant='secondary')
-    staged = gr.Markdown('No PDF attachments waiting to send.')
-    tokens = gr.Slider(64, 8192, value=2048, step=64,
-                       label='Maximum output tokens')
-    details = gr.Markdown('')
+            question = gr.Textbox(label='Message',
+                                  placeholder='Write a message and/or attach PDFs, then click Send…',
+                                  scale=8, lines=2)
+            with gr.Row():
+                attach = gr.UploadButton('📎 Attach PDF', file_types=['.pdf'],
+                                        file_count='single', type='filepath', variant='secondary')
+                submit = gr.Button('Send', variant='primary', scale=1)
+            with gr.Row():
+                retrieval_button = gr.Button('📚 PDF Retrieval: ON', variant='secondary')
+        staged = gr.Markdown('No PDF attachments waiting to send.')
+        tokens = gr.Slider(64, 8192, value=2048, step=64,
+                           label='Maximum output tokens')
+        hops = gr.Slider(2, 10, value=DEFAULT_MAX_HOPS, step=1,
+                         label='Maximum search hops (papers and standards included)')
+        details = gr.Markdown('')
 
-    # Attaching stages the PDF in the composer only. The PDF is not processed,
-    # and no chat bubble is created, until the user clicks Send.
-    attach.upload(stage_pdf, [attach, pending_files], [pending_files, staged], queue=False)
-    clear.click(clear_conversation, [documents, chat, model_history],
-                [documents, chat, status, question, pending_files, staged,
-                 pending_query, details, model_history], concurrency_limit=1, concurrency_id='pdf_chat')
-    retrieval_button.click(
-        toggle_retrieval,
-        inputs=[retrieval_enabled],
-        outputs=[retrieval_enabled, retrieval_button],
-        queue=False,
-    )
-    # Both Enter and Send submit the same user turn (text + staged PDFs).
-    for trigger in (submit.click, question.submit):
-        event = trigger(send_message, [question, pending_files, documents, chat],
-                        [chat, documents, question, pending_files, staged,
-                         pending_query, status, details],
-                        concurrency_limit=1, concurrency_id='pdf_chat')
-        event.then(ask, [chat, documents, tokens, pending_query, model_history, retrieval_enabled],
-                   [chat, details, model_history],
-                   concurrency_limit=1, concurrency_id='pdf_chat')
-    gr.Markdown('Each turn retrieves up to the configured page limit. Previous questions '
-                'and answers remain in context; previous PDF evidence does not. '
-                'Indexed corpus retrieval requires PDF_INDEX_DIR and PDF_DATABASE_ROOT.')
+        # Attaching stages the PDF in the composer only. The PDF is not processed,
+        # and no chat bubble is created, until the user clicks Send.
+        attach.upload(stage_pdf, [attach, pending_files], [pending_files, staged], queue=False)
+        clear.click(clear_conversation, [documents, chat, model_history],
+                    [documents, chat, status, question, pending_files, staged,
+                     pending_query, details, model_history], concurrency_limit=1, concurrency_id='pdf_chat')
+        retrieval_button.click(
+            toggle_retrieval,
+            inputs=[retrieval_enabled],
+            outputs=[retrieval_enabled, retrieval_button],
+            queue=False,
+        )
+        # Both Enter and Send submit the same user turn (text + staged PDFs).
+        for trigger in (submit.click, question.submit):
+            event = trigger(send_message, [question, pending_files, documents, chat],
+                            [chat, documents, question, pending_files, staged,
+                             pending_query, status, details],
+                            concurrency_limit=1, concurrency_id='pdf_chat')
+            event.then(ask, [chat, documents, tokens, pending_query, model_history, retrieval_enabled, hops],
+                       [chat, details, model_history],
+                       concurrency_limit=1, concurrency_id='pdf_chat')
+        gr.Markdown('Each turn retrieves up to the configured number of parent page groups. Previous questions '
+                    'and answers remain in context; previous PDF evidence does not. '
+                    'Configure paper and standards index paths using environment variables.')
+
+    return demo
 
 if __name__ == '__main__':
     initialize_model()
-    demo.queue(default_concurrency_limit=1).launch(
+    build_gradio_app().queue(default_concurrency_limit=1).launch(
         server_name=os.environ.get('GRADIO_SERVER_NAME', '127.0.0.1'),
         server_port=int(os.environ.get('GRADIO_SERVER_PORT', '7860')),
         show_error=True,
