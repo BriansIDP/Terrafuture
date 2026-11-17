@@ -30,11 +30,16 @@ export HF_HOME=/projects/u6zu/Terrafuture/ckpt
 
 traindata=data/preprocess/phase1_questions_modified.json
 
-python train_qwen35_dpo.py \
-    --rollouts rollouts/qwen35_pdfqa_with_retriever_max3_top3.json \
-    --questions $traindata \
-    --database-root data/Phase1PDFBase \
-    --output-dir results/qwen35_trajectory_dpo_max3_top3 \
+# Provide a scored JSON list with multiple standards-first rollouts per question.
+: "${ROLLOUTS:?Set ROLLOUTS to a scored standards-first dual-source rollout JSON file}"
+
+python train_qwen35_dpo_stage3.py \
+    --model "$model" \
+    --rollouts "$ROLLOUTS" \
+    --questions "$traindata" \
+    --paper-database-root data/Phase1PDFBase \
+    --standards-database-root data/Phase1Standards \
+    --output-dir results/qwen35_trajectory_dpo_stage3 \
     --min-score-gap 0.5 \
     --max-pairs-per-qid 10 \
     --beta 0.1 \

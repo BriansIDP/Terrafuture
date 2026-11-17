@@ -76,7 +76,9 @@ def evidence_excerpts(dataset, evidence):
     excerpts = []
     for item in evidence:
         children = item.get('matched_children')
-        if children is not None:
+        if '_parent_excerpt' in item:
+            excerpt = item['_parent_excerpt']
+        elif children is not None:
             excerpt = '\n'.join(c['text'][:1200] for c in children[:2])
         else:
             texts = [block.get('text', '') for page in dataset.pages_for(item)
@@ -88,46 +90,52 @@ def evidence_excerpts(dataset, evidence):
 
 
 def reconstruct_planner_segments(dataset, record):
-    """Rebuild prompts and use the actual raw completions, including invalid ones."""
+    """Rebuild the exact inference planner prompts from the logged retained hits."""
     question = record['question']
     trace = record.get('retrieval_trace')
-    if not trace:
-        raise ValueError(f"{record['qid']}: missing dual-source retrieval trace")
-    if trace[0].get('source') != 'papers' or (len(trace) > 1 and trace[1].get('source') != 'standards'):
-        raise ValueError(f"{record['qid']}: expected initial paper and standards searches")
+    if not trace or trace[0].get('source') != 'standards':
+        raise ValueError(f"{record['qid']}: expected an initial standards search")
     evidence, segments = [], []
     for i, hop in enumerate(trace):
         if 'new_pages' not in hop:
             raise ValueError(f"{record['qid']}: missing new_pages at hop {i + 1}")
-        evidence.extend(hop['new_pages'])
-        excerpts = evidence_excerpts(dataset, evidence)
-        if i == 0:
-            prompt = (
-                'Generate a search query for structural design standards needed to answer '
-                'the engineering question. Use the paper evidence to identify relevant '
-                'design provisions, terminology and referenced standards. Target the '
-                'applicable requirements, clauses, tables, conditions or exceptions, '
-                'rather than research findings. Do not answer the question or invent '
-                'standard numbers or clauses. Return ONLY one JSON object: '
-                '{"query":"specific standards requirements or topic"}.\n\nQuestion: '
-                + question + '\n\nPaper evidence:\n' + excerpts
-            )
-            generated = hop.get('standards_query_generation')
-            if not isinstance(generated, dict) or 'raw' not in generated:
-                raise ValueError(f"{record['qid']}: missing raw standards query generation")
-            segments.append((prompt, generated['raw']))
-        elif 'planner' in hop:
-            prompt = (
-                'Decide whether the evidence is sufficient to answer the engineering '
-                'question. Consider missing research findings, applicable standard '
-                'requirements, conditions, exceptions, annexes and tables. Do not answer '
-                'the question. Return ONLY one JSON object: {"decision":"ANSWER"} or '
-                '{"decision":"RETRIEVE","source":"papers" or "standards",'
-                '"query":"specific missing information"}. Choose a single source for '
-                'each retrieval.\n\nQuestion: ' + question + '\n\nEvidence:\n' + excerpts
-            )
-            planner = hop['planner']
-            if not isinstance(planner, dict) or 'raw' not in planner:
-                raise ValueError(f"{record['qid']}: missing raw planner output at hop {i + 1}")
-            segments.append((prompt, planner['raw']))
+        if i == 1 and hop.get('source') != 'papers':
+            raise ValueError(f"{record['qid']}: second search must target papers")
+        for item in hop['new_pages']:
+            # Inference retains matched children only from the selected pages.
+            # Older traces without raw_results fall back to manifest text.
+            retained = dict(item)
+            for hit in hop.get('raw_results', []):
+                if hit.get('parent', {}).get('doc_id') == item['doc_id']:
+                    pages = [int(p) for p in item['pages']]
+                    children = [c for c in hit.get('matched_children', [])
+                                if int(c['page']) in pages]
+                    if children:
+                        retained['matched_children'] = children
+                    elif pages == hit['parent'].get('page_numbers'):
+                        retained['_parent_excerpt'] = hit['parent'].get('text', '')[:1800]
+                    else:
+                        retained['matched_children'] = []
+                    break
+            evidence.append(retained)
+        if 'planner' not in hop:
+            continue
+        planner = hop['planner']
+        if not isinstance(planner, dict) or 'raw' not in planner:
+            raise ValueError(f"{record['qid']}: missing raw planner output at hop {i + 1}")
+        retrieval_option = (
+            '{"decision":"RETRIEVE","source":"papers","query":"specific missing information"}. '
+            'The only permitted retrieval source is papers.' if i == 0 else
+            '{"decision":"RETRIEVE","source":"papers" or "standards",'
+            '"query":"specific missing information"}. Choose a single source for each retrieval.'
+        )
+        prompt = (
+            'Decide whether the evidence is sufficient to answer the engineering '
+            'question. Consider missing research findings, applicable standard '
+            'requirements, conditions, exceptions, annexes and tables. Do not answer '
+            'the question. Return ONLY one JSON object: {"decision":"ANSWER"} or '
+            + retrieval_option + '\n\nQuestion: ' + question + '\n\nEvidence:\n' +
+            evidence_excerpts(dataset, evidence)
+        )
+        segments.append((prompt, planner['raw']))
     return segments

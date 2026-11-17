@@ -3,7 +3,7 @@
 
 Planner evidence is reconstructed from manifest text when exact retriever
 snippets were not logged; it therefore approximates the inference context.
-The initial paper search is deterministic and has no generated action to score.
+The initial standards search is deterministic and has no generated action to score.
 """
 
 import argparse
