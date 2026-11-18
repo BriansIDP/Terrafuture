@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Qwen multi-hop inference over separate paper and standards indexes.
 
-Each question searches standards first and papers second. The model can then
-answer or search either source. All searches count against
---max-hops. Build each index with retriever.py build against its database root.
+The model decides whether to search, prioritizing unresolved standards and
+their cross-references before research papers. Each source has its own search
+limit. Build each index with retriever.py build against its database root.
 """
 
 import argparse
@@ -32,17 +32,17 @@ INSTRUCTIONS = (
 )
 
 
-def evidence_excerpts(evidence):
+def evidence_excerpts(evidence, max_passages=2, passage_chars=1200, parent_chars=1800):
     """Format only retained evidence for retrieval planning."""
     excerpts = []
     for hit in evidence:
         parent = hit['parent']
         matches = hit.get('matched_children', [])
-        excerpt = '\n'.join(c['text'][:1200] for c in matches[:2])
+        excerpt = '\n'.join(c['text'][:passage_chars] for c in matches[:max_passages])
         # Parent text can include pages excluded by the page budget. Avoid using it
         # unless the entire parent was retained.
         if not excerpt and hit['pages'] == parent['page_numbers']:
-            excerpt = parent.get('text', '')[:1800]
+            excerpt = parent.get('text', '')[:parent_chars]
         excerpts.append(
             f"Source {hit['source']}, document {parent['doc_id']}, "
             f"pages {hit['pages']}:\n{excerpt or '[Page image only]'}"
@@ -51,22 +51,37 @@ def evidence_excerpts(evidence):
 
 
 def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sample=False,
-                    papers_only=False):
+                    available_sources=('standards', 'papers'), max_passages=2,
+                    passage_chars=1200, parent_chars=1800):
     """Choose ANSWER or a retrieval source and query."""
-    retrieval_option = (
-        '{"decision":"RETRIEVE","source":"papers","query":"specific missing information"}. '
-        'The only permitted retrieval source is papers.'
-        if papers_only else
-        '{"decision":"RETRIEVE","source":"papers" or "standards",'
-        '"query":"specific missing information"}. Choose a single source for each retrieval.'
-    )
     prompt = (
-        'Decide whether the evidence is sufficient to answer the engineering '
-        'question. Consider missing research findings, applicable standard '
-        'requirements, conditions, exceptions, annexes and tables. Do not answer '
-        'the question. Return ONLY one JSON object: {"decision":"ANSWER"} or '
-        + retrieval_option + '\n\nQuestion: ' + question + '\n\nEvidence:\n' +
-        evidence_excerpts(evidence)
+        'Decide the next step for this question. If it is straightforward or not '
+        'relevant to a concrete design and can be answered without retrieval, '
+        'choose ANSWER even when there is no evidence. For a concrete design, '
+        'standards provide UK design guidance and requirements; papers provide '
+        'material properties, research findings and evidence on novel designs. '
+        'First identify applicable standards and resolve relevant cross-chapter '
+        'references, conditions, exceptions, annexes and tables before moving '
+        'on to papers. Search standards again with a targeted query when a '
+        'reference or requirement remains unclear. Once applicable standards '
+        'are sufficiently clear, search papers when material properties or '
+        'new materials, findings or designs require research evidence; such '
+        'paper evidence is often needed. If standards are not applicable, '
+        'search papers directly when research evidence is needed. Choose ANSWER '
+        'when the available evidence suffices or further searches are unlikely '
+        'to help; do not assume missing requirements or research findings. '
+        'Evidence excerpts may omit image-only content, which is not proof that '
+        'a requirement is resolved. Do not answer the question. Return ONLY '
+        'one JSON object: {"decision":"ANSWER"} or '
+        '{"decision":"RETRIEVE","source":"papers" or "standards",'
+        '"query":"specific missing information"}. Choose one source per search. '
+        'Sources with remaining searches: ' + ', '.join(available_sources) + '. '
+        'Only choose a source with remaining searches. If a necessary source '
+        'is unavailable, use the remaining sources if useful or choose ANSWER '
+        'and acknowledge missing evidence in the answer.'
+        '\n\nQuestion: ' + question + '\n\nEvidence:\n' +
+        (evidence_excerpts(evidence, max_passages, passage_chars, parent_chars)
+         or '[No evidence retrieved]')
     )
     raw = generate_text(model, processor, [{'role': 'user', 'content': prompt}],
                         max_new_tokens, do_sample=do_sample)
@@ -78,8 +93,7 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sam
             return {'decision': 'ANSWER', 'raw': raw}
         source = str(obj.get('source', '')).lower().strip()
         query = str(obj.get('query', '')).strip()
-        allowed_sources = ('papers',) if papers_only else ('papers', 'standards')
-        if action == 'RETRIEVE' and source in allowed_sources and query:
+        if action == 'RETRIEVE' and source in available_sources and query:
             return {'decision': 'RETRIEVE', 'source': source, 'query': query, 'raw': raw}
     except (ValueError, TypeError, AttributeError):
         pass
@@ -87,15 +101,31 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sam
     return {'decision': 'INVALID', 'raw': raw}
 
 
-def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
+def retrieve_evidence(question, retrievers, decide, max_hops_by_source, max_pages,
                       top_n_by_source, candidates, rerank_top, progress=None, on_hop=None):
-    """Search standards and papers first, then follow the planner."""
+    """Let the planner decide whether and where to search at every step."""
     collected, seen_pages, trace = [], set(), []
-    source, query = 'standards', question
+    counts = {source: 0 for source in max_hops_by_source}
     stop_reason = 'max_hops'
-    for hop in range(1, max_hops + 1):
+    for hop in range(1, sum(max_hops_by_source.values()) + 1):
+        available_sources = tuple(source for source, limit in max_hops_by_source.items()
+                                  if counts[source] < limit)
         if progress:
-            progress(f'Search {hop}/{max_hops}: searching {source} for: {query}')
+            progress('Checking whether to search and which source to use.')
+        decision = decide(question, collected, available_sources)
+        if decision['decision'] != 'RETRIEVE':
+            trace.append({'hop': hop - 1, 'planner': decision})
+            stop_reason = 'answer' if decision['decision'] == 'ANSWER' else 'invalid_decision'
+            break
+        source, query = decision['source'], decision['query']
+        if source not in available_sources:
+            trace.append({'hop': hop - 1, 'planner': decision})
+            stop_reason = 'invalid_decision'
+            break
+        counts[source] += 1
+        if progress:
+            progress(f'Search {hop}: searching {source} ({counts[source]}/'
+                     f'{max_hops_by_source[source]}) for: {query}')
         hits = retrievers[source].search(query=query, candidates=candidates,
                                          rerank_top=rerank_top, top_n=top_n_by_source[source])['results']
         added = []
@@ -121,7 +151,7 @@ def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
                                             if int(c['page']) in pages]
             collected.append(selected)
             added.append({'source': source, 'doc_id': parent['doc_id'], 'pages': pages})
-        entry = {'hop': hop, 'source': source, 'query': query,
+        entry = {'hop': hop, 'source': source, 'query': query, 'planner': decision,
                  'raw_results': [{'doc_id': hit['parent']['doc_id'],
                                   'pages': hit['parent']['page_numbers']}
                                  for hit in hits],
@@ -132,28 +162,12 @@ def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
         if progress:
             progress(f'Search {hop}: found {len(hits)} results, added '
                      f'{sum(len(item["pages"]) for item in added)} pages.')
-        if hop == max_hops:
+        if hop == sum(max_hops_by_source.values()):
             stop_reason = 'max_hops'
             break
-        if hop == 1:
-            source, query = 'papers', question
-            continue
         if len(seen_pages) >= max_pages:
             stop_reason = 'max_evidence_pages'
             break
-        if progress:
-            progress('Checking whether the evidence is sufficient and which source to search next.')
-        decision = decide(question, collected, False)
-        entry['planner'] = decision
-        entry['decision'] = decision['decision']
-        if decision['decision'] != 'RETRIEVE':
-            if progress:
-                progress('Proceeding to answer.')
-            stop_reason = 'answer'
-            break
-        source, query = decision['source'], decision['query']
-        if progress:
-            progress(f'Planner chose to search {source}.')
     if progress:
         progress(f'Retrieval stopped: {stop_reason}.')
     return collected, trace, stop_reason
@@ -221,9 +235,16 @@ def main():
     ap.add_argument('--standards-top-n', type=int, help='Ranked standards parent passages per search (overrides --top-n)')
     ap.add_argument('--candidates', type=int, default=100)
     ap.add_argument('--rerank-top', type=int, default=50)
-    ap.add_argument('--max-hops', type=int, default=4, help='Maximum total searches, including the initial standards search')
+    ap.add_argument('--max-standards-hops', type=int, default=4, help='Maximum standards searches')
+    ap.add_argument('--max-paper-hops', type=int, default=4, help='Maximum paper searches')
     ap.add_argument('--max-evidence-pages', type=int, default=18)
     ap.add_argument('--decision-tokens', type=int, default=160)
+    ap.add_argument('--planner-max-passages', type=int, default=2,
+                    help='Maximum matching passages per retrieved result in the planner prompt')
+    ap.add_argument('--planner-passage-chars', type=int, default=1200,
+                    help='Maximum characters per matching passage in the planner prompt')
+    ap.add_argument('--planner-parent-chars', type=int, default=1800,
+                    help='Maximum characters of fallback parent text in the planner prompt')
     ap.add_argument('--max-new-tokens', type=int, default=768)
     ap.add_argument('--max-pixels', type=int, default=128000)
     ap.add_argument('--content-mode', choices=['image', 'hybrid'], default='hybrid')
@@ -233,13 +254,14 @@ def main():
     ap.add_argument('--do-sample', action='store_true')
     ap.add_argument('--seed', type=int, default=50)
     args = ap.parse_args()
-    if args.max_hops < 2 or args.max_evidence_pages < 1:
-        ap.error('--max-hops must be at least 2 and --max-evidence-pages must be positive')
+    if min(args.max_standards_hops, args.max_paper_hops) < 0 or args.max_evidence_pages < 1:
+        ap.error('source hop limits must be non-negative and --max-evidence-pages must be positive')
     top_n_by_source = {
         'papers': args.paper_top_n if args.paper_top_n is not None else args.top_n,
         'standards': args.standards_top_n if args.standards_top_n is not None else args.top_n,
     }
-    if min(args.top_n, *top_n_by_source.values(), args.candidates, args.rerank_top, args.decision_tokens, args.max_new_tokens) < 1:
+    if min(args.top_n, *top_n_by_source.values(), args.candidates, args.rerank_top, args.decision_tokens, args.max_new_tokens,
+           args.planner_max_passages, args.planner_passage_chars, args.planner_parent_chars) < 1:
         ap.error('retrieval and generation counts must be positive')
     roots = {'papers': args.paper_database_root, 'standards': args.standards_database_root}
     indexes = {'papers': args.paper_index_dir, 'standards': args.standards_index_dir}
@@ -269,10 +291,12 @@ def main():
     results = []
     for record in tqdm(records, desc='Dual-source multi-hop RAG'):
         question = record['question']
-        planner = lambda q, e, papers_only: decide_next_hop(
-            model, processor, q, e, args.decision_tokens, args.do_sample, papers_only)
+        planner = lambda q, e, sources: decide_next_hop(
+            model, processor, q, e, args.decision_tokens, args.do_sample, sources,
+            args.planner_max_passages, args.planner_passage_chars, args.planner_parent_chars)
         evidence, trace, stop_reason = retrieve_evidence(
-            question, retrievers, planner, args.max_hops, args.max_evidence_pages,
+            question, retrievers, planner,
+            {'standards': args.max_standards_hops, 'papers': args.max_paper_hops}, args.max_evidence_pages,
             top_n_by_source, args.candidates, args.rerank_top)
         messages = build_messages(question, evidence, roots, args.content_mode, args.inline_images)
         prediction = generate_text(model, processor, messages, args.max_new_tokens, args.do_sample)

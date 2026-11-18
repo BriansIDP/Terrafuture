@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Online GRPO for standards-first, dual-source Qwen retrieval trajectories.
 
-For each question, search standards and papers, then sample planner decisions
-and an answer from the current LoRA policy. A frozen Qwen judge scores each
+For each question, sample retrieval decisions and an answer from the current
+LoRA policy. A frozen Qwen judge scores each
 answer against the reference, and GRPO updates the sampled tokens online. No
 rollout file is required. The judge and retrievers can use separate devices.
 """
@@ -81,10 +81,14 @@ def sample_trajectory(model, processor, record, retrievers, roots, args, step=No
         m, p, messages, limit, segments,
         lambda size: log(f'hop={hop} planner_input_tokens={size}'))
     try:
-        planner = lambda q, e, papers_only: dual.decide_next_hop(
-            model, processor, q, e, args.decision_tokens, True, papers_only)
+        planner = lambda q, e, sources: dual.decide_next_hop(
+            model, processor, q, e, args.decision_tokens, True, sources,
+            args.planner_max_passages, args.planner_passage_chars, args.planner_parent_chars)
         evidence, trace, stop = dual.retrieve_evidence(
-            record['question'], retrievers, planner, args.max_hops, args.max_evidence_pages,
+            record['question'], retrievers, planner,
+            {'standards': args.max_standards_hops if args.max_standards_hops is not None else args.max_hops,
+             'papers': args.max_paper_hops if args.max_paper_hops is not None else args.max_hops},
+            args.max_evidence_pages,
             {'papers': args.paper_top_n, 'standards': args.standards_top_n},
             args.candidates, args.rerank_top, on_hop=on_hop)
         messages = dual.build_messages(record['question'], evidence, roots, args.content_mode, args.inline_images)
@@ -189,12 +193,20 @@ def main():
     p.add_argument('--clip-epsilon', type=float, default=0.2)
     p.add_argument('--max-grad-norm', type=float, default=1.0)
     p.add_argument('--max-hops', type=int, default=3)
+    p.add_argument('--max-standards-hops', type=int, help='Standards search limit (defaults to --max-hops)')
+    p.add_argument('--max-paper-hops', type=int, help='Paper search limit (defaults to --max-hops)')
     p.add_argument('--paper-top-n', type=int, default=3)
     p.add_argument('--standards-top-n', type=int, default=3)
     p.add_argument('--max-evidence-pages', type=int, default=18)
     p.add_argument('--candidates', type=int, default=100)
     p.add_argument('--rerank-top', type=int, default=50)
     p.add_argument('--decision-tokens', type=int, default=160)
+    p.add_argument('--planner-max-passages', type=int, default=2,
+                   help='Maximum matching passages per retrieved result in the planner prompt')
+    p.add_argument('--planner-passage-chars', type=int, default=1200,
+                   help='Maximum characters per matching passage in the planner prompt')
+    p.add_argument('--planner-parent-chars', type=int, default=1800,
+                   help='Maximum characters of fallback parent text in the planner prompt')
     p.add_argument('--max-new-tokens', type=int, default=768)
     p.add_argument('--max-pixels', type=int, default=128000)
     p.add_argument('--content-mode', choices=['image', 'hybrid'], default='hybrid')
@@ -210,8 +222,12 @@ def main():
     args = p.parse_args()
     if args.group_size < 2 or args.max_hops < 2 or min(args.epochs, args.updates_per_group,
         args.paper_top_n, args.standards_top_n, args.max_evidence_pages, args.candidates,
-        args.rerank_top, args.decision_tokens, args.max_new_tokens, args.save_steps) < 1:
+        args.rerank_top, args.decision_tokens, args.max_new_tokens, args.save_steps,
+        args.planner_max_passages, args.planner_passage_chars, args.planner_parent_chars) < 1:
         p.error('group-size and max-hops must be at least 2; other count arguments must be positive')
+    if any(limit is not None and limit < 0 for limit in
+           (args.max_standards_hops, args.max_paper_hops)):
+        p.error('source hop limits must be non-negative')
     if not 0 < args.clip_epsilon < 1 or args.beta < 0 or args.learning_rate <= 0 or args.max_grad_norm <= 0:
         p.error('invalid optimization arguments')
     records = read_records(args.questions)
