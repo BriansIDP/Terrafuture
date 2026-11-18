@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Qwen multi-hop inference over separate paper and standards indexes.
 
-Each question searches standards first. The model can then answer or search
-papers; subsequent searches can target either source. All searches count against
+Each question searches standards first and papers second. The model can then
+answer or search either source. All searches count against
 --max-hops. Build each index with retriever.py build against its database root.
 """
 
@@ -83,13 +83,13 @@ def decide_next_hop(model, processor, question, evidence, max_new_tokens, do_sam
             return {'decision': 'RETRIEVE', 'source': source, 'query': query, 'raw': raw}
     except (ValueError, TypeError, AttributeError):
         pass
-    # Do not silently treat malformed planner output as a valid ANSWER.
+    # Preserve malformed output in the trace; retrieval will proceed to answer.
     return {'decision': 'INVALID', 'raw': raw}
 
 
 def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
-                      top_n_by_source, candidates, rerank_top, progress=None):
-    """Search standards first, then follow the planner within the budget."""
+                      top_n_by_source, candidates, rerank_top, progress=None, on_hop=None):
+    """Search standards and papers first, then follow the planner."""
     collected, seen_pages, trace = [], set(), []
     source, query = 'standards', question
     stop_reason = 'max_hops'
@@ -127,38 +127,33 @@ def retrieve_evidence(question, retrievers, decide, max_hops, max_pages,
                                  for hit in hits],
                  'new_pages': added, 'total_pages': len(seen_pages)}
         trace.append(entry)
+        if on_hop:
+            on_hop(entry)
         if progress:
             progress(f'Search {hop}: found {len(hits)} results, added '
                      f'{sum(len(item["pages"]) for item in added)} pages.')
         if hop == max_hops:
             stop_reason = 'max_hops'
             break
+        if hop == 1:
+            source, query = 'papers', question
+            continue
         if len(seen_pages) >= max_pages:
             stop_reason = 'max_evidence_pages'
             break
         if progress:
-            progress('Checking whether the evidence is sufficient' +
-                     (' or papers are needed.' if hop == 1 else ' and which source to search next.'))
-        decision = decide(question, collected, hop == 1)
+            progress('Checking whether the evidence is sufficient and which source to search next.')
+        decision = decide(question, collected, False)
         entry['planner'] = decision
         entry['decision'] = decision['decision']
-        if decision['decision'] == 'ANSWER':
+        if decision['decision'] != 'RETRIEVE':
             if progress:
-                progress('Planner chose to answer.')
+                progress('Proceeding to answer.')
             stop_reason = 'answer'
             break
-        if decision['decision'] != 'RETRIEVE':
-            # Malformed planner output is not an ANSWER. Continue with a
-            # deterministic fallback until the search budget is exhausted.
-            source = 'papers' if hop == 1 or source == 'standards' else 'standards'
-            query = question
-            entry['fallback'] = {'source': source, 'query': query}
-            if progress:
-                progress(f'Planner response was invalid; falling back to {source}.')
-        else:
-            source, query = decision['source'], decision['query']
-            if progress:
-                progress(f'Planner chose to search {source}.')
+        source, query = decision['source'], decision['query']
+        if progress:
+            progress(f'Planner chose to search {source}.')
     if progress:
         progress(f'Retrieval stopped: {stop_reason}.')
     return collected, trace, stop_reason
@@ -238,8 +233,8 @@ def main():
     ap.add_argument('--do-sample', action='store_true')
     ap.add_argument('--seed', type=int, default=50)
     args = ap.parse_args()
-    if args.max_hops < 1 or args.max_evidence_pages < 1:
-        ap.error('--max-hops and --max-evidence-pages must be positive')
+    if args.max_hops < 2 or args.max_evidence_pages < 1:
+        ap.error('--max-hops must be at least 2 and --max-evidence-pages must be positive')
     top_n_by_source = {
         'papers': args.paper_top_n if args.paper_top_n is not None else args.top_n,
         'standards': args.standards_top_n if args.standards_top_n is not None else args.top_n,

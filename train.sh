@@ -30,19 +30,20 @@ export HF_HOME=/projects/u6zu/Terrafuture/ckpt
 
 traindata=/projects/u6zu/Terrafuture/Terra1/data/phase1_stage3_type_a_questions.json
 
-# Provide multiple scored rollouts per question, including behavior_logprob.
-: "${ROLLOUTS:?Set ROLLOUTS to a scored rollout JSON file with behavior_logprob}"
-
 python train_qwen35_grpo_stage3.py \
     --model "$model" \
-    --rollouts "$ROLLOUTS" \
     --questions "$traindata" \
     --paper-database-root data/Phase1PDFBase \
     --standards-database-root data/Phase1Standards \
-    --output-dir results/qwen35_trajectory_grpo_stage3 \
+    --output-dir exp/qwen35_trajectory_grpo_stage3 \
+    --judge-device cuda:0 \
     --beta 0.1 \
     --epochs 3 \
     --learning-rate 1e-5 \
-    --warmup 10 \
+    --group-size 4 \
+    --max-hops 3 \
+    --paper-top-n 3 \
+    --standards-top-n 3 \
+    --verbosity 1 \
     --lora-r 128 \
     --lora-alpha 256
