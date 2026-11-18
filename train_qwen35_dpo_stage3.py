@@ -257,7 +257,7 @@ def main():
         learning_rate=args.learning_rate, bf16=True, tf32=True, gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         warmup_steps=args.warmup, lr_scheduler_type="cosine", max_grad_norm=1.0,
-        save_strategy="steps", save_steps=args.save_steps, save_total_limit=2,
+        save_strategy="steps", save_steps=args.save_steps, save_total_limit=10,
         logging_steps=1, remove_unused_columns=False, dataloader_num_workers=2,
         report_to="none", optim="adamw_torch")
     trainer = TrajectoryDPOTrainer(
